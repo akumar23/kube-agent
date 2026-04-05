@@ -1,0 +1,15 @@
+# Simple dev Dockerfile - uses local binary
+FROM alpine:3.19
+
+WORKDIR /
+
+RUN apk add --no-cache ca-certificates
+
+# Copy the pre-built binary
+COPY bin/manager-linux /manager
+
+# Create non-root user
+RUN adduser -D -u 65532 nonroot
+USER 65532:65532
+
+ENTRYPOINT ["/manager"]
