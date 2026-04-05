@@ -1,0 +1,166 @@
+# Default values for kube-agent
+# This is a YAML-formatted file.
+
+replicaCount: 1
+
+image:
+  repository: ghcr.io/kube-agent/kube-agent
+  pullPolicy: IfNotPresent
+  tag: ""  # Overrides the image tag (default is chart appVersion)
+
+imagePullSecrets: []
+nameOverride: ""
+fullnameOverride: ""
+
+serviceAccount:
+  create: true
+  annotations: {}
+  name: ""
+
+# Controller configuration
+controller:
+  # Enable/disable specific controllers
+  deployment:
+    enabled: true
+  security:
+    enabled: true
+    # Default scan schedule (cron format)
+    scanSchedule: "0 */6 * * *"
+    # Minimum severity to report
+    severityThreshold: MEDIUM
+  selfHealing:
+    enabled: true
+    # Maximum remediation actions per hour
+    maxActionsPerHour: 10
+    # Require approval for destructive actions
+    requireApproval: false
+    # Dry-run mode (log actions but don't execute)
+    dryRunMode: false
+  diagnostic:
+    enabled: true
+
+# Trivy scanner configuration
+trivy:
+  enabled: true
+  image:
+    repository: aquasec/trivy
+    tag: "0.50.0"
+  # Cache configuration
+  cache:
+    enabled: true
+    persistentVolume:
+      enabled: false
+      size: 5Gi
+      storageClass: ""
+
+# ArgoCD integration
+argocd:
+  enabled: false
+  # ArgoCD server URL (if external)
+  server: ""
+  # Install ArgoCD as a dependency
+  install: false
+
+# Argo Rollouts integration
+rollouts:
+  enabled: true
+
+# cert-manager integration
+certManager:
+  enabled: true
+  # Default cluster issuer
+  clusterIssuer: letsencrypt-prod
+  # Let's Encrypt email
+  email: ""
+  # Use staging server for testing
+  staging: false
+
+# Ingress controller configuration
+ingress:
+  # Ingress class to use
+  class: traefik
+  # Install Traefik as a dependency
+  installTraefik: false
+
+# Default settings for ManagedApplications
+defaults:
+  # Default deployment strategy
+  deploymentStrategy: rolling
+  # Default replica count
+  replicas: 1
+  # Enable TLS by default
+  tlsEnabled: true
+  # Enable vulnerability scanning by default
+  vulnerabilityScanEnabled: true
+  # Enable self-healing by default
+  selfHealingEnabled: true
+
+# Security settings
+security:
+  # Pod Security Standards
+  podSecurityStandard: restricted
+  # Run as non-root
+  runAsNonRoot: true
+  # Read-only root filesystem
+  readOnlyRootFilesystem: true
+  # Drop all capabilities
+  dropCapabilities: true
+
+# Resource limits
+resources:
+  limits:
+    cpu: 500m
+    memory: 512Mi
+  requests:
+    cpu: 100m
+    memory: 128Mi
+
+# Node selector
+nodeSelector: {}
+
+# Tolerations
+tolerations: []
+
+# Affinity
+affinity: {}
+
+# Metrics and monitoring
+metrics:
+  enabled: true
+  serviceMonitor:
+    enabled: false
+    interval: 30s
+    namespace: ""
+
+# Logging
+logging:
+  level: info
+  format: json
+
+# Notifications
+notifications:
+  slack:
+    enabled: false
+    channel: ""
+    webhookSecretName: ""
+  email:
+    enabled: false
+    recipients: []
+    smtpSecretName: ""
+
+# Leader election
+leaderElection:
+  enabled: true
+  leaseDuration: 15s
+  renewDeadline: 10s
+  retryPeriod: 2s
+
+# Multi-cluster support
+multiCluster:
+  enabled: false
+  clusters: []
+  # Example:
+  # - name: production
+  #   kubeconfigSecretName: prod-kubeconfig
+  # - name: staging
+  #   kubeconfigSecretName: staging-kubeconfig

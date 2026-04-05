@@ -1,0 +1,58 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "kube-agent.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "kube-agent.labels" . | nindent 4 }}
+data:
+  config.yaml: |
+    # Kube-Agent Configuration
+    controller:
+      deployment:
+        enabled: {{ .Values.controller.deployment.enabled }}
+      security:
+        enabled: {{ .Values.controller.security.enabled }}
+        scanSchedule: {{ .Values.controller.security.scanSchedule | quote }}
+        severityThreshold: {{ .Values.controller.security.severityThreshold }}
+      selfHealing:
+        enabled: {{ .Values.controller.selfHealing.enabled }}
+        maxActionsPerHour: {{ .Values.controller.selfHealing.maxActionsPerHour }}
+        requireApproval: {{ .Values.controller.selfHealing.requireApproval }}
+        dryRunMode: {{ .Values.controller.selfHealing.dryRunMode }}
+      diagnostic:
+        enabled: {{ .Values.controller.diagnostic.enabled }}
+
+    # Default settings for new applications
+    defaults:
+      deploymentStrategy: {{ .Values.defaults.deploymentStrategy }}
+      replicas: {{ .Values.defaults.replicas }}
+      tlsEnabled: {{ .Values.defaults.tlsEnabled }}
+      vulnerabilityScanEnabled: {{ .Values.defaults.vulnerabilityScanEnabled }}
+      selfHealingEnabled: {{ .Values.defaults.selfHealingEnabled }}
+
+    # Ingress configuration
+    ingress:
+      class: {{ .Values.ingress.class }}
+
+    # cert-manager configuration
+    {{- if .Values.certManager.enabled }}
+    certManager:
+      clusterIssuer: {{ .Values.certManager.clusterIssuer }}
+    {{- end }}
+
+    # Trivy configuration
+    {{- if .Values.trivy.enabled }}
+    trivy:
+      enabled: true
+      image: "{{ .Values.trivy.image.repository }}:{{ .Values.trivy.image.tag }}"
+    {{- end }}
+
+    # Logging
+    logging:
+      level: {{ .Values.logging.level }}
+      format: {{ .Values.logging.format }}
+
+    # Metrics
+    metrics:
+      enabled: {{ .Values.metrics.enabled }}

@@ -1,0 +1,117 @@
+{{- if .Values.serviceAccount.create -}}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ include "kube-agent.serviceAccountName" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "kube-agent.labels" . | nindent 4 }}
+  {{- with .Values.serviceAccount.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+---
+{{- end }}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "kube-agent.fullname" . }}
+  labels:
+    {{- include "kube-agent.labels" . | nindent 4 }}
+rules:
+  # ManagedApplication management
+  - apiGroups: ["agent.kubeagent.io"]
+    resources: ["managedapplications", "managedapplications/status", "managedapplications/finalizers"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: ["agent.kubeagent.io"]
+    resources: ["clusterconfigs", "clusterconfigs/status"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: ["agent.kubeagent.io"]
+    resources: ["securityreports", "securityreports/status"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: ["agent.kubeagent.io"]
+    resources: ["remediationpolicies", "remediationpolicies/status"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+
+  # Core Kubernetes resources for deployments
+  - apiGroups: [""]
+    resources: ["pods", "pods/log"]
+    verbs: ["get", "list", "watch", "delete"]
+  - apiGroups: [""]
+    resources: ["services", "configmaps"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  # Secrets: read-only access only. The operator reads SecretReferences for
+  # credentials (e.g. Slack webhook, SMTP); it never needs to create or modify secrets.
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["get", "list", "watch", "create", "patch"]
+  - apiGroups: [""]
+    resources: ["namespaces"]
+    verbs: ["get", "list", "watch"]
+
+  # Apps resources
+  - apiGroups: ["apps"]
+    resources: ["deployments", "replicasets", "statefulsets", "daemonsets"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+
+  # Networking for ingress
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["ingresses", "ingressclasses"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+
+  # cert-manager for TLS - certificates/issuers can be created; clusterissuers are
+  # cluster-scoped infrastructure that the operator should never delete.
+  - apiGroups: ["cert-manager.io"]
+    resources: ["certificates", "certificaterequests", "issuers"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: ["cert-manager.io"]
+    resources: ["clusterissuers"]
+    verbs: ["get", "list", "watch"]
+
+  # ArgoCD integration (if enabled)
+  {{- if .Values.argocd.enabled }}
+  - apiGroups: ["argoproj.io"]
+    resources: ["applications", "applicationsets", "appprojects"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  {{- end }}
+
+  # Argo Rollouts integration (if enabled)
+  {{- if .Values.rollouts.enabled }}
+  - apiGroups: ["argoproj.io"]
+    resources: ["rollouts", "analysistemplates", "analysisruns"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  {{- end }}
+
+  # Leader election
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+
+  # Node information for diagnostics
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["get", "list", "watch"]
+
+  # Metrics
+  - apiGroups: ["metrics.k8s.io"]
+    resources: ["pods", "nodes"]
+    verbs: ["get", "list"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ include "kube-agent.fullname" . }}
+  labels:
+    {{- include "kube-agent.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ include "kube-agent.fullname" . }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "kube-agent.serviceAccountName" . }}
+    namespace: {{ .Release.Namespace }}

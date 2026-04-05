@@ -1,0 +1,453 @@
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: managedapplications.agent.kubeagent.io
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.14.0
+spec:
+  group: agent.kubeagent.io
+  names:
+    kind: ManagedApplication
+    listKind: ManagedApplicationList
+    plural: managedapplications
+    singular: managedapplication
+    shortNames:
+      - mapp
+      - mapps
+  scope: Namespaced
+  versions:
+    - name: v1alpha1
+      served: true
+      storage: true
+      subresources:
+        status: {}
+      additionalPrinterColumns:
+        - name: Phase
+          type: string
+          jsonPath: .status.phase
+        - name: URL
+          type: string
+          jsonPath: .status.publicURL
+        - name: Health
+          type: string
+          jsonPath: .status.health
+        - name: Age
+          type: date
+          jsonPath: .metadata.creationTimestamp
+      schema:
+        openAPIV3Schema:
+          type: object
+          properties:
+            apiVersion:
+              type: string
+            kind:
+              type: string
+            metadata:
+              type: object
+            spec:
+              type: object
+              required:
+                - source
+              properties:
+                source:
+                  type: object
+                  required:
+                    - type
+                  properties:
+                    type:
+                      type: string
+                      enum: ["git", "helm", "docker"]
+                    repository:
+                      type: string
+                    path:
+                      type: string
+                    branch:
+                      type: string
+                    chart:
+                      type: string
+                    chartVersion:
+                      type: string
+                    image:
+                      type: string
+                    fallbackImage:
+                      type: string
+                      description: Fallback image to use when primary image fails
+                    command:
+                      type: array
+                      items:
+                        type: string
+                    args:
+                      type: array
+                      items:
+                        type: string
+                    values:
+                      type: object
+                      additionalProperties:
+                        type: string
+                deployment:
+                  type: object
+                  properties:
+                    strategy:
+                      type: string
+                      enum: ["rolling", "canary", "blue-green"]
+                      default: rolling
+                    replicas:
+                      type: integer
+                      default: 1
+                    autoRollback:
+                      type: boolean
+                      default: true
+                    canary:
+                      type: object
+                      properties:
+                        steps:
+                          type: array
+                          items:
+                            type: object
+                            properties:
+                              setWeight:
+                                type: integer
+                              pause:
+                                type: object
+                                properties:
+                                  duration:
+                                    type: string
+                    healthChecks:
+                      type: object
+                      properties:
+                        enabled:
+                          type: boolean
+                          default: true
+                        failureThreshold:
+                          type: integer
+                          default: 3
+                publicAccess:
+                  type: object
+                  properties:
+                    enabled:
+                      type: boolean
+                    host:
+                      type: string
+                    port:
+                      type: integer
+                      default: 80
+                    ingressClass:
+                      type: string
+                    tls:
+                      type: object
+                      properties:
+                        enabled:
+                          type: boolean
+                        issuer:
+                          type: string
+                          default: letsencrypt-prod
+                        secretName:
+                          type: string
+                security:
+                  type: object
+                  properties:
+                    vulnerabilityScanning:
+                      type: object
+                      properties:
+                        enabled:
+                          type: boolean
+                        schedule:
+                          type: string
+                          default: "0 */6 * * *"
+                        severityThreshold:
+                          type: string
+                          enum: ["CRITICAL", "HIGH", "MEDIUM", "LOW"]
+                          default: MEDIUM
+                        autoBlock:
+                          type: boolean
+                        autoPatch:
+                          type: boolean
+                    clusterScanning:
+                      type: object
+                      properties:
+                        enabled:
+                          type: boolean
+                        frameworks:
+                          type: array
+                          items:
+                            type: string
+                        schedule:
+                          type: string
+                selfHealing:
+                  type: object
+                  properties:
+                    enabled:
+                      type: boolean
+                    maxRetries:
+                      type: integer
+                      default: 3
+                    diagnosticCollection:
+                      type: boolean
+                      default: true
+                    autoRestart:
+                      type: boolean
+                      default: true
+                    autoScale:
+                      type: boolean
+                    notifyOnRemediation:
+                      type: boolean
+                targetNamespace:
+                  type: string
+            status:
+              type: object
+              properties:
+                phase:
+                  type: string
+                health:
+                  type: string
+                publicURL:
+                  type: string
+                lastDeployedAt:
+                  type: string
+                  format: date-time
+                lastScannedAt:
+                  type: string
+                  format: date-time
+                vulnerabilityCount:
+                  type: object
+                  additionalProperties:
+                    type: integer
+                currentRevision:
+                  type: string
+                desiredRevision:
+                  type: string
+                remediationAttempts:
+                  type: integer
+                message:
+                  type: string
+                conditions:
+                  type: array
+                  items:
+                    type: object
+                    properties:
+                      type:
+                        type: string
+                      status:
+                        type: string
+                      lastTransitionTime:
+                        type: string
+                        format: date-time
+                      reason:
+                        type: string
+                      message:
+                        type: string
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: securityreports.agent.kubeagent.io
+spec:
+  group: agent.kubeagent.io
+  names:
+    kind: SecurityReport
+    listKind: SecurityReportList
+    plural: securityreports
+    singular: securityreport
+    shortNames:
+      - sreport
+  scope: Namespaced
+  versions:
+    - name: v1alpha1
+      served: true
+      storage: true
+      subresources:
+        status: {}
+      additionalPrinterColumns:
+        - name: Schedule
+          type: string
+          jsonPath: .spec.schedule
+        - name: Last Run
+          type: date
+          jsonPath: .status.lastRunAt
+        - name: Status
+          type: string
+          jsonPath: .status.phase
+      schema:
+        openAPIV3Schema:
+          type: object
+          properties:
+            apiVersion:
+              type: string
+            kind:
+              type: string
+            metadata:
+              type: object
+            spec:
+              type: object
+              properties:
+                schedule:
+                  type: string
+                  default: "0 0 * * 0"
+                targets:
+                  type: array
+                  items:
+                    type: object
+                    properties:
+                      namespace:
+                        type: string
+                      application:
+                        type: string
+                formats:
+                  type: array
+                  items:
+                    type: string
+                  default: ["HTML", "JSON"]
+                delivery:
+                  type: object
+                  properties:
+                    slack:
+                      type: string
+                    email:
+                      type: array
+                      items:
+                        type: string
+                    webhook:
+                      type: string
+                    s3Bucket:
+                      type: string
+                includeClusterScan:
+                  type: boolean
+                  default: true
+                includeVulnerabilities:
+                  type: boolean
+                  default: true
+                includeRemediation:
+                  type: boolean
+                  default: true
+            status:
+              type: object
+              properties:
+                phase:
+                  type: string
+                lastRunAt:
+                  type: string
+                  format: date-time
+                nextRunAt:
+                  type: string
+                  format: date-time
+                lastReportURL:
+                  type: string
+                summary:
+                  type: object
+                  properties:
+                    totalVulnerabilities:
+                      type: integer
+                    criticalCount:
+                      type: integer
+                    highCount:
+                      type: integer
+                    mediumCount:
+                      type: integer
+                    complianceScore:
+                      type: integer
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: remediationpolicies.agent.kubeagent.io
+spec:
+  group: agent.kubeagent.io
+  names:
+    kind: RemediationPolicy
+    listKind: RemediationPolicyList
+    plural: remediationpolicies
+    singular: remediationpolicy
+    shortNames:
+      - rempol
+  scope: Cluster
+  versions:
+    - name: v1alpha1
+      served: true
+      storage: true
+      subresources:
+        status: {}
+      schema:
+        openAPIV3Schema:
+          type: object
+          properties:
+            apiVersion:
+              type: string
+            kind:
+              type: string
+            metadata:
+              type: object
+            spec:
+              type: object
+              required:
+                - rules
+              properties:
+                enabled:
+                  type: boolean
+                selector:
+                  type: object
+                  properties:
+                    namespaces:
+                      type: array
+                      items:
+                        type: string
+                    labelSelector:
+                      type: object
+                      x-kubernetes-preserve-unknown-fields: true
+                rules:
+                  type: array
+                  items:
+                    type: object
+                    required:
+                      - name
+                      - condition
+                      - action
+                    properties:
+                      name:
+                        type: string
+                      condition:
+                        type: object
+                        required:
+                          - type
+                        properties:
+                          type:
+                            type: string
+                          threshold:
+                            type: integer
+                            default: 3
+                          duration:
+                            type: string
+                      action:
+                        type: object
+                        required:
+                          - type
+                        properties:
+                          type:
+                            type: string
+                          parameters:
+                            type: object
+                            additionalProperties:
+                              type: string
+                      cooldown:
+                        type: string
+                        default: "5m"
+                safetyLimits:
+                  type: object
+                  properties:
+                    maxActionsPerHour:
+                      type: integer
+                      default: 10
+                    maxAffectedPodsPercent:
+                      type: integer
+                      default: 25
+                    requireApproval:
+                      type: boolean
+                    dryRunMode:
+                      type: boolean
+            status:
+              type: object
+              properties:
+                actionsExecuted:
+                  type: integer
+                lastActionAt:
+                  type: string
+                  format: date-time
