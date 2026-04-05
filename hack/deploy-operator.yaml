@@ -1,0 +1,93 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: kube-agent-system
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: kube-agent
+  namespace: kube-agent-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: kube-agent
+rules:
+  # ManagedApplication management
+  - apiGroups: ["agent.kubeagent.io"]
+    resources: ["*"]
+    verbs: ["*"]
+  # Core resources
+  - apiGroups: [""]
+    resources: ["pods", "pods/log", "services", "configmaps", "secrets", "events", "namespaces"]
+    verbs: ["*"]
+  # Apps resources
+  - apiGroups: ["apps"]
+    resources: ["deployments", "replicasets", "statefulsets", "daemonsets"]
+    verbs: ["*"]
+  # Networking
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["ingresses", "ingressclasses"]
+    verbs: ["*"]
+  # Leader election
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["*"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: kube-agent
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: kube-agent
+subjects:
+  - kind: ServiceAccount
+    name: kube-agent
+    namespace: kube-agent-system
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: kube-agent
+  namespace: kube-agent-system
+  labels:
+    app: kube-agent
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: kube-agent
+  template:
+    metadata:
+      labels:
+        app: kube-agent
+    spec:
+      serviceAccountName: kube-agent
+      containers:
+        - name: manager
+          image: kube-agent:dev
+          imagePullPolicy: Never
+          args:
+            - --leader-elect=false
+          resources:
+            limits:
+              cpu: 500m
+              memory: 256Mi
+            requests:
+              cpu: 100m
+              memory: 128Mi
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8081
+            initialDelaySeconds: 15
+            periodSeconds: 20
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: 8081
+            initialDelaySeconds: 5
+            periodSeconds: 10

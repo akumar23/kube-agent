@@ -1,0 +1,190 @@
+# Example: Deploy a simple web application with public URL and security scanning
+apiVersion: agent.kubeagent.io/v1alpha1
+kind: ManagedApplication
+metadata:
+  name: demo-app
+  namespace: default
+spec:
+  source:
+    type: docker
+    image: nginx:latest
+
+  deployment:
+    strategy: canary
+    replicas: 2
+    autoRollback: true
+    canary:
+      steps:
+        - setWeight: 20
+        - pause:
+            duration: "2m"
+        - setWeight: 50
+        - pause:
+            duration: "2m"
+        - setWeight: 100
+    healthChecks:
+      enabled: true
+      failureThreshold: 3
+
+  publicAccess:
+    enabled: true
+    host: demo-app.example.com
+    port: 80
+    tls:
+      enabled: true
+      issuer: letsencrypt-prod
+
+  security:
+    vulnerabilityScanning:
+      enabled: true
+      schedule: "0 */6 * * *"
+      severityThreshold: MEDIUM
+      autoBlock: true
+      autoPatch: false
+    clusterScanning:
+      enabled: true
+      frameworks:
+        - NSA
+        - CIS
+      schedule: "0 0 * * 0"
+
+  selfHealing:
+    enabled: true
+    maxRetries: 3
+    diagnosticCollection: true
+    autoRestart: true
+    notifyOnRemediation: true
+
+---
+# Example: Deploy from a Git repository
+apiVersion: agent.kubeagent.io/v1alpha1
+kind: ManagedApplication
+metadata:
+  name: gitops-app
+  namespace: default
+spec:
+  source:
+    type: git
+    repository: https://github.com/your-org/your-app
+    path: ./kubernetes
+    branch: main
+
+  deployment:
+    strategy: rolling
+    replicas: 3
+    autoRollback: true
+
+  publicAccess:
+    enabled: true
+    host: gitops-app.example.com
+    tls:
+      enabled: true
+
+  security:
+    vulnerabilityScanning:
+      enabled: true
+      severityThreshold: HIGH
+
+  selfHealing:
+    enabled: true
+
+---
+# Example: Deploy a Helm chart
+apiVersion: agent.kubeagent.io/v1alpha1
+kind: ManagedApplication
+metadata:
+  name: helm-app
+  namespace: default
+spec:
+  source:
+    type: helm
+    repository: https://charts.bitnami.com/bitnami
+    chart: postgresql
+    chartVersion: "15.0.0"
+    values:
+      auth.postgresPassword: "changeme"
+      primary.persistence.size: "10Gi"
+
+  deployment:
+    strategy: rolling
+    autoRollback: true
+
+  security:
+    vulnerabilityScanning:
+      enabled: true
+
+  selfHealing:
+    enabled: true
+
+---
+# Example: Security Report Configuration
+apiVersion: agent.kubeagent.io/v1alpha1
+kind: SecurityReport
+metadata:
+  name: weekly-security-report
+  namespace: default
+spec:
+  schedule: "0 0 * * 0"  # Weekly on Sunday
+  targets:
+    - namespace: default
+    - namespace: production
+  formats:
+    - HTML
+    - JSON
+    - SARIF
+  delivery:
+    slack: "#security-alerts"
+    email:
+      - security@example.com
+  includeClusterScan: true
+  includeVulnerabilities: true
+  includeRemediation: true
+
+---
+# Example: Remediation Policy
+apiVersion: agent.kubeagent.io/v1alpha1
+kind: RemediationPolicy
+metadata:
+  name: default-remediation
+spec:
+  enabled: true
+  selector:
+    namespaces:
+      - default
+      - production
+  rules:
+    - name: restart-crashloop
+      condition:
+        type: CrashLoopBackOff
+        threshold: 3
+      action:
+        type: restart
+      cooldown: "5m"
+
+    - name: notify-oom
+      condition:
+        type: OOMKilled
+        threshold: 2
+      action:
+        type: notify
+        parameters:
+          channel: "#alerts"
+      cooldown: "10m"
+
+    - name: scale-resource-pressure
+      condition:
+        type: HighResourceUsage
+        threshold: 1
+        duration: "5m"
+      action:
+        type: scale
+        parameters:
+          increment: "1"
+          maxReplicas: "10"
+      cooldown: "15m"
+
+  safetyLimits:
+    maxActionsPerHour: 10
+    maxAffectedPodsPercent: 25
+    requireApproval: false
+    dryRunMode: false

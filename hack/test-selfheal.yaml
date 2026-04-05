@@ -1,0 +1,54 @@
+# RemediationPolicy to handle crash loops
+apiVersion: agent.kubeagent.io/v1alpha1
+kind: RemediationPolicy
+metadata:
+  name: default-remediation
+spec:
+  enabled: true
+  rules:
+    - name: restart-on-crashloop
+      condition:
+        type: CrashLoopBackOff
+        threshold: 3
+      action:
+        type: restart
+      cooldown: "1m"
+    - name: handle-oom
+      condition:
+        type: OOMKilled
+        threshold: 2
+      action:
+        type: notify
+        parameters:
+          channel: "ops-alerts"
+      cooldown: "5m"
+  safetyLimits:
+    maxActionsPerHour: 10
+    maxAffectedPodsPercent: 50
+    dryRunMode: false
+---
+# A crashing application to test self-healing
+apiVersion: agent.kubeagent.io/v1alpha1
+kind: ManagedApplication
+metadata:
+  name: crasher
+  namespace: demo
+spec:
+  source:
+    type: docker
+    image: busybox:latest
+    # This command will crash with exit code 1 after printing a message
+    command: ["/bin/sh", "-c"]
+    args: ["echo 'Starting app...' && sleep 2 && echo 'Simulating crash!' && exit 1"]
+  deployment:
+    replicas: 1
+    strategy: rolling
+    autoRollback: true
+  publicAccess:
+    enabled: false
+    port: 80
+  selfHealing:
+    enabled: true
+    maxRetries: 5
+    autoRestart: true
+    diagnosticCollection: true

@@ -1,0 +1,32 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: demo
+---
+apiVersion: agent.kubeagent.io/v1alpha1
+kind: ManagedApplication
+metadata:
+  name: nginx-demo
+  namespace: demo
+spec:
+  source:
+    type: docker
+    image: nginx:1.25
+  deployment:
+    replicas: 2
+    strategy: rolling
+    autoRollback: true
+  publicAccess:
+    enabled: true
+    host: nginx-demo.localhost
+    port: 80
+  selfHealing:
+    enabled: true
+    maxRetries: 3
+    autoRestart: true
+    diagnosticCollection: true
+  security:
+    vulnerabilityScanning:
+      enabled: true
+      schedule: "0 0 * * 0"
+      severityThreshold: MEDIUM

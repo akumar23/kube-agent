@@ -1,0 +1,49 @@
+# RemediationPolicy that uses fallback image for crash loops
+apiVersion: agent.kubeagent.io/v1alpha1
+kind: RemediationPolicy
+metadata:
+  name: fallback-remediation
+spec:
+  enabled: true
+  rules:
+    - name: use-fallback-on-crashloop
+      condition:
+        type: CrashLoopBackOff
+        threshold: 3  # After 3 crashes, switch to fallback
+      action:
+        type: useFallback
+      cooldown: "30s"
+  safetyLimits:
+    maxActionsPerHour: 10
+    maxAffectedPodsPercent: 50
+    dryRunMode: false
+---
+# App with a crashing command but a working fallback
+apiVersion: agent.kubeagent.io/v1alpha1
+kind: ManagedApplication
+metadata:
+  name: smart-app
+  namespace: demo
+spec:
+  source:
+    type: docker
+    # Primary image with a crashing command
+    image: busybox:latest
+    # Fallback to working nginx
+    fallbackImage: nginx:1.25-alpine
+    # This command crashes immediately
+    command: ["/bin/sh", "-c"]
+    args: ["echo 'App starting...' && sleep 1 && echo 'CRASH!' && exit 1"]
+  deployment:
+    replicas: 1
+    strategy: rolling
+    autoRollback: true
+  publicAccess:
+    enabled: true
+    host: smart-app.localhost
+    port: 80
+  selfHealing:
+    enabled: true
+    maxRetries: 5
+    autoRestart: true
+    diagnosticCollection: true
