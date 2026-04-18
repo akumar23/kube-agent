@@ -18,6 +18,7 @@ import (
 
 	agentv1alpha1 "github.com/kube-agent/kube-agent/pkg/apis/v1alpha1"
 	"github.com/kube-agent/kube-agent/pkg/types"
+	"github.com/kube-agent/kube-agent/pkg/utils/executor"
 )
 
 // Scanner interface for vulnerability scanning
@@ -81,16 +82,30 @@ func (r *SecurityScanReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		return ctrl.Result{RequeueAfter: 5 * time.Minute}, nil
 	}
 
-	// Scan each image
+	// Scan images in parallel using a bounded worker pool.
+	const maxScanWorkers = 5
+	pool := executor.NewPool(min(len(images), maxScanWorkers), r.Log)
+	for _, image := range images {
+		image := image
+		if err := pool.Submit(executor.Task{
+			Name: image,
+			Execute: func(ctx context.Context) (interface{}, error) {
+				return r.scanImage(ctx, image, log)
+			},
+		}); err != nil {
+			log.Error(err, "Failed to submit scan task", "image", image)
+		}
+	}
+
 	totalVulns := make(map[string]int32)
 	var criticalVulns []types.VulnerabilityInfo
 
-	for _, image := range images {
-		result, err := r.scanImage(ctx, image, log)
-		if err != nil {
-			log.Error(err, "Failed to scan image", "image", image)
+	for _, res := range pool.Execute(ctx) {
+		if res.Error != nil {
+			log.Error(res.Error, "Failed to scan image", "image", res.Name)
 			continue
 		}
+		result := res.Data.(*types.ScanResult)
 
 		// Aggregate results
 		for severity, count := range result.Counts {

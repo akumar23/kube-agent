@@ -4,9 +4,9 @@
 replicaCount: 1
 
 image:
-  repository: ghcr.io/kube-agent/kube-agent
-  pullPolicy: IfNotPresent
-  tag: ""  # Overrides the image tag (default is chart appVersion)
+  repository: kube-agent
+  tag: dev
+  pullPolicy: Never
 
 imagePullSecrets: []
 nameOverride: ""
@@ -65,7 +65,7 @@ argocd:
 rollouts:
   enabled: true
 
-# cert-manager integration
+# cert-manager integration (kube-agent operator settings)
 certManager:
   enabled: true
   # Default cluster issuer
@@ -74,6 +74,11 @@ certManager:
   email: ""
   # Use staging server for testing
   staging: false
+
+# cert-manager subchart values (passed directly to the cert-manager Helm chart)
+# installCRDs must be true — cainjector crashes on startup without the CRDs present
+cert-manager:
+  installCRDs: true
 
 # Ingress controller configuration
 ingress:

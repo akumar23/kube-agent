@@ -17,6 +17,8 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
+
+	"github.com/kube-agent/kube-agent/pkg/utils/executor"
 )
 
 // DiagnosticReconciler performs diagnostic analysis on failing pods
@@ -275,42 +277,75 @@ var errorPatterns = []struct {
 	},
 }
 
-// analyzeLogsForPatterns scans container logs for known error patterns
+// containerLogResult holds pattern-match findings for a single container.
+type containerLogResult struct {
+	patterns    []LogPattern
+	suggestions []string
+}
+
+// analyzeLogsForPatterns scans container logs for known error patterns.
+// Containers are scanned in parallel using a bounded worker pool.
 func (r *DiagnosticReconciler) analyzeLogsForPatterns(ctx context.Context, pod *corev1.Pod, diagnosis *Diagnosis, log logr.Logger) {
 	if r.Clientset == nil {
 		log.Info("Kubernetes clientset not configured, skipping log analysis")
 		return
 	}
 
-	tailLines := int64(100)
-	for _, container := range pod.Spec.Containers {
-		// Get recent logs
-		logs, err := r.Clientset.CoreV1().Pods(pod.Namespace).GetLogs(pod.Name, &corev1.PodLogOptions{
-			Container:  container.Name,
-			TailLines:  &tailLines,
-			Timestamps: true,
-		}).Do(ctx).Raw()
+	containers := pod.Spec.Containers
+	if len(containers) == 0 {
+		return
+	}
 
-		if err != nil {
-			log.Error(err, "Failed to get logs", "container", container.Name)
+	const maxWorkers = 5
+	pool := executor.NewPool(min(len(containers), maxWorkers), log)
+
+	tailLines := int64(100)
+	for _, container := range containers {
+		container := container
+		if err := pool.Submit(executor.Task{
+			Name: container.Name,
+			Execute: func(ctx context.Context) (interface{}, error) {
+				logs, err := r.Clientset.CoreV1().Pods(pod.Namespace).GetLogs(pod.Name, &corev1.PodLogOptions{
+					Container:  container.Name,
+					TailLines:  &tailLines,
+					Timestamps: true,
+				}).Do(ctx).Raw()
+				if err != nil {
+					return nil, err
+				}
+
+				logStr := string(logs)
+				var result containerLogResult
+				for _, ep := range errorPatterns {
+					matches := ep.Pattern.FindAllString(logStr, -1)
+					if len(matches) > 0 {
+						result.patterns = append(result.patterns, LogPattern{
+							Pattern:     ep.Pattern.String(),
+							Count:       len(matches),
+							Severity:    ep.Severity,
+							Explanation: ep.Explanation,
+						})
+						result.suggestions = append(result.suggestions, ep.Suggestion)
+					}
+				}
+				return result, nil
+			},
+		}); err != nil {
+			log.Error(err, "Failed to submit log analysis task", "container", container.Name)
+		}
+	}
+
+	for _, res := range pool.Execute(ctx) {
+		if res.Error != nil {
+			log.Error(res.Error, "Failed to get logs", "container", res.Name)
 			continue
 		}
-
-		logStr := string(logs)
-
-		// Search for known patterns
-		for _, ep := range errorPatterns {
-			matches := ep.Pattern.FindAllString(logStr, -1)
-			if len(matches) > 0 {
-				diagnosis.LogPatterns = append(diagnosis.LogPatterns, LogPattern{
-					Pattern:     ep.Pattern.String(),
-					Count:       len(matches),
-					Severity:    ep.Severity,
-					Explanation: ep.Explanation,
-				})
-				diagnosis.Suggestions = append(diagnosis.Suggestions, ep.Suggestion)
-			}
+		if res.Data == nil {
+			continue
 		}
+		scanResult := res.Data.(containerLogResult)
+		diagnosis.LogPatterns = append(diagnosis.LogPatterns, scanResult.patterns...)
+		diagnosis.Suggestions = append(diagnosis.Suggestions, scanResult.suggestions...)
 	}
 }
 

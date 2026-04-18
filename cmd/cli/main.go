@@ -1,23 +1,32 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"fmt"
 	"os"
+	"strings"
+	"sync"
 	"text/tabwriter"
 	"time"
 
 	"github.com/spf13/cobra"
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/dynamic"
+	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
+	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
+	ctrlclient "sigs.k8s.io/controller-runtime/pkg/client"
 
 	agentv1alpha1 "github.com/kube-agent/kube-agent/pkg/apis/v1alpha1"
+	"github.com/kube-agent/kube-agent/pkg/agent"
 )
 
 var (
@@ -430,10 +439,74 @@ func newLogsCmd() *cobra.Command {
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			name := args[0]
-			fmt.Printf("Fetching logs for %s...\n", name)
+			ctx := context.Background()
 
-			// TODO: Implement log streaming
-			fmt.Println("Log streaming not yet implemented")
+			// Step 1: confirm the ManagedApplication exists.
+			dynClient, err := getDynamicClient()
+			if err != nil {
+				return fmt.Errorf("failed to create client: %w", err)
+			}
+			gvr := schema.GroupVersionResource{
+				Group:    "agent.kubeagent.io",
+				Version:  "v1alpha1",
+				Resource: "managedapplications",
+			}
+			if _, err = dynClient.Resource(gvr).Namespace(namespace).Get(
+				ctx, name, metav1.GetOptions{}); err != nil {
+				return fmt.Errorf("application %q not found in namespace %q: %w",
+					name, namespace, err)
+			}
+
+			// Step 2: list pods for this application.
+			clientset, err := getClientset()
+			if err != nil {
+				return fmt.Errorf("failed to create clientset: %w", err)
+			}
+
+			labelSelector := fmt.Sprintf("agent.kubeagent.io/app=%s", name)
+			pods, err := clientset.CoreV1().Pods(namespace).List(ctx, metav1.ListOptions{
+				LabelSelector: labelSelector,
+			})
+			if err != nil {
+				return fmt.Errorf("failed to list pods: %w", err)
+			}
+			if len(pods.Items) == 0 {
+				return fmt.Errorf("no pods found for application %q (label %s)",
+					name, labelSelector)
+			}
+
+			// Step 3: stream logs concurrently from every pod.
+			var wg sync.WaitGroup
+			errCh := make(chan error, len(pods.Items))
+
+			for _, pod := range pods.Items {
+				wg.Add(1)
+				go func(podName string) {
+					defer wg.Done()
+					if err := streamPodLogs(ctx, clientset, namespace, podName, follow, tailLines); err != nil {
+						errCh <- fmt.Errorf("pod %s: %w", podName, err)
+					}
+				}(pod.Name)
+			}
+
+			// Close the error channel once all goroutines finish so the
+			// range below terminates.
+			go func() {
+				wg.Wait()
+				close(errCh)
+			}()
+
+			// Collect and report errors without hiding successful pods.
+			var errs []error
+			for err := range errCh {
+				errs = append(errs, err)
+			}
+			if len(errs) > 0 {
+				for _, e := range errs {
+					fmt.Fprintf(os.Stderr, "error: %v\n", e)
+				}
+				return fmt.Errorf("log streaming finished with %d error(s)", len(errs))
+			}
 
 			return nil
 		},
@@ -445,24 +518,207 @@ func newLogsCmd() *cobra.Command {
 	return cmd
 }
 
-// newDiagnoseCmd creates the diagnose subcommand
-func newDiagnoseCmd() *cobra.Command {
-	cmd := &cobra.Command{
-		Use:   "diagnose [name]",
-		Short: "Run diagnostics on an application",
-		Args:  cobra.ExactArgs(1),
-		RunE: func(cmd *cobra.Command, args []string) error {
-			name := args[0]
-			fmt.Printf("Running diagnostics for %s...\n\n", name)
+// streamPodLogs opens a log stream for a single pod and writes each line to
+// stdout prefixed with the pod name. It returns nil on normal EOF.
+func streamPodLogs(
+	ctx context.Context,
+	clientset *kubernetes.Clientset,
+	ns, podName string,
+	follow bool,
+	tailLines int64,
+) error {
+	opts := &corev1.PodLogOptions{
+		Follow:    follow,
+		TailLines: &tailLines,
+	}
 
-			// TODO: Implement diagnostics
-			fmt.Println("Diagnostics not yet implemented")
+	req := clientset.CoreV1().Pods(ns).GetLogs(podName, opts)
+	stream, err := req.Stream(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to open log stream: %w", err)
+	}
+	defer stream.Close()
+
+	prefix := fmt.Sprintf("[%s] ", podName)
+	scanner := bufio.NewScanner(stream)
+	for scanner.Scan() {
+		fmt.Printf("%s%s\n", prefix, scanner.Text())
+	}
+
+	return scanner.Err()
+}
+
+// newDiagnoseCmd creates the diagnose subcommand — runs the AI agent interactively.
+func newDiagnoseCmd() *cobra.Command {
+	var (
+		ollamaURL   string
+		ollamaModel string
+		dryRun      bool
+		autoApprove bool
+	)
+
+	cmd := &cobra.Command{
+		Use:   "diagnose [app-name]",
+		Short: "Run AI-powered diagnostics and self-healing on an application",
+		Long: `Runs an AI agent (via Ollama) to diagnose and fix issues with a managed application.
+The agent investigates pod events and logs, then takes corrective actions.
+You will be prompted to approve any write operations unless --auto-approve is set.`,
+		Args: cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			appName := args[0]
+
+			if ollamaURL == "" {
+				ollamaURL = os.Getenv("OLLAMA_URL")
+			}
+			if ollamaURL == "" {
+				return fmt.Errorf("--ollama-url or OLLAMA_URL env var is required")
+			}
+
+			ctx := context.Background()
+
+			// Build Kubernetes clients.
+			restConfig, err := buildRestConfig()
+			if err != nil {
+				return fmt.Errorf("build kubeconfig: %w", err)
+			}
+			clientset, err := kubernetes.NewForConfig(restConfig)
+			if err != nil {
+				return fmt.Errorf("create clientset: %w", err)
+			}
+
+			scheme := runtime.NewScheme()
+			clientgoscheme.AddToScheme(scheme)   //nolint:errcheck
+			agentv1alpha1.AddToScheme(scheme)    //nolint:errcheck
+			crClient, err := ctrlclient.New(restConfig, ctrlclient.Options{Scheme: scheme})
+			if err != nil {
+				return fmt.Errorf("create controller-runtime client: %w", err)
+			}
+
+			// Find unhealthy pods for this app.
+			labelSelector := fmt.Sprintf("agent.kubeagent.io/app=%s", appName)
+			pods, err := clientset.CoreV1().Pods(namespace).List(ctx, metav1.ListOptions{
+				LabelSelector: labelSelector,
+			})
+			if err != nil {
+				return fmt.Errorf("list pods for %s: %w", appName, err)
+			}
+			if len(pods.Items) == 0 {
+				return fmt.Errorf("no pods found for application %q (label %s)", appName, labelSelector)
+			}
+
+			unhealthy := filterUnhealthyPods(pods.Items)
+			if len(unhealthy) == 0 {
+				fmt.Printf("All pods for %q appear healthy. Run 'kube-agent logs %s' to inspect further.\n",
+					appName, appName)
+				return nil
+			}
+
+			fmt.Printf("Found %d unhealthy pod(s) for %q. Starting AI diagnosis...\n\n", len(unhealthy), appName)
+
+			// Build the remediator with interactive confirmation.
+			remediator := agent.NewRemediator(
+				ollamaURL, ollamaModel,
+				crClient, clientset,
+				nil, // nil = all write tools permitted (gated by confirm below)
+				dryRun,
+			)
+			remediator.Output = os.Stdout
+
+			if !autoApprove {
+				remediator.SetConfirmFn(func(toolName, description string) bool {
+					fmt.Printf("\n  ⚠  Write operation: %s\n  Proceed? [y/N]: ", description)
+					var input string
+					fmt.Scanln(&input)
+					return strings.ToLower(strings.TrimSpace(input)) == "y"
+				})
+			}
+
+			for i := range unhealthy {
+				pod := &unhealthy[i]
+				issue := detectIssue(pod)
+				if err := remediator.Remediate(ctx, pod, issue); err != nil {
+					fmt.Fprintf(os.Stderr, "error remediating %s: %v\n", pod.Name, err)
+				}
+			}
 
 			return nil
 		},
 	}
 
+	cmd.Flags().StringVar(&ollamaURL, "ollama-url", "", "Ollama base URL (or set OLLAMA_URL env var)")
+	cmd.Flags().StringVar(&ollamaModel, "ollama-model", "", "Ollama model (default: "+agent.DefaultModel+")")
+	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "Show what the agent would do without executing writes")
+	cmd.Flags().BoolVar(&autoApprove, "auto-approve", false, "Execute write operations without confirmation prompts")
+
 	return cmd
+}
+
+// filterUnhealthyPods returns pods that are not fully running/ready.
+func filterUnhealthyPods(pods []corev1.Pod) []corev1.Pod {
+	var unhealthy []corev1.Pod
+	for _, pod := range pods {
+		if pod.Status.Phase == corev1.PodPending || pod.Status.Phase == corev1.PodFailed {
+			unhealthy = append(unhealthy, pod)
+			continue
+		}
+		for _, cs := range pod.Status.ContainerStatuses {
+			if cs.State.Waiting != nil || !cs.Ready {
+				unhealthy = append(unhealthy, pod)
+				break
+			}
+		}
+	}
+	return unhealthy
+}
+
+// detectIssue constructs a basic IssueContext from pod status for the initial agent message.
+func detectIssue(pod *corev1.Pod) agent.IssueContext {
+	for _, cs := range pod.Status.ContainerStatuses {
+		if cs.State.Waiting != nil {
+			return agent.IssueContext{
+				Type:      cs.State.Waiting.Reason,
+				Container: cs.Name,
+				Message:   cs.State.Waiting.Message,
+			}
+		}
+	}
+	for _, cond := range pod.Status.Conditions {
+		if cond.Type == corev1.PodScheduled && cond.Status == corev1.ConditionFalse {
+			return agent.IssueContext{
+				Type:    cond.Reason,
+				Message: cond.Message,
+			}
+		}
+	}
+	return agent.IssueContext{
+		Type:    string(pod.Status.Phase),
+		Message: pod.Status.Message,
+	}
+}
+
+// buildRestConfig builds a REST config from (in priority order):
+// 1. --kubeconfig flag
+// 2. KUBECONFIG env var
+// 3. ~/.kube/config
+// 4. in-cluster config (when running inside a pod)
+func buildRestConfig() (*rest.Config, error) {
+	// Explicit flag takes priority.
+	if kubeconfig != "" {
+		return clientcmd.BuildConfigFromFlags("", kubeconfig)
+	}
+	// Use default loading rules: respects KUBECONFIG env var and ~/.kube/config.
+	loadingRules := clientcmd.NewDefaultClientConfigLoadingRules()
+	clientConfig := clientcmd.NewNonInteractiveDeferredLoadingClientConfig(
+		loadingRules, &clientcmd.ConfigOverrides{})
+	if config, err := clientConfig.ClientConfig(); err == nil {
+		return config, nil
+	}
+	// Last resort: in-cluster config when running as a pod.
+	config, err := rest.InClusterConfig()
+	if err != nil {
+		return nil, fmt.Errorf("no kubeconfig found — pass --kubeconfig, set KUBECONFIG env var, or run inside a cluster")
+	}
+	return config, nil
 }
 
 // Helper functions
@@ -478,6 +734,17 @@ func getDynamicClient() (dynamic.Interface, error) {
 	}
 
 	return dynamic.NewForConfig(config)
+}
+
+func getClientset() (*kubernetes.Clientset, error) {
+	config, err := clientcmd.BuildConfigFromFlags("", kubeconfig)
+	if err != nil {
+		config, err = rest.InClusterConfig()
+		if err != nil {
+			return nil, err
+		}
+	}
+	return kubernetes.NewForConfig(config)
 }
 
 func buildManagedApplication(name, ns, sourceType string, opts map[string]interface{}) *unstructured.Unstructured {

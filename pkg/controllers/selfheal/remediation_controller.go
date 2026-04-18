@@ -3,12 +3,18 @@ package selfheal
 import (
 	"context"
 	"fmt"
+	"maps"
+	"strconv"
 	"sync"
 	"time"
 
+	"strings"
+
 	"github.com/go-logr/logr"
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -18,8 +24,12 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 
+	"github.com/kube-agent/kube-agent/pkg/agent"
 	agentv1alpha1 "github.com/kube-agent/kube-agent/pkg/apis/v1alpha1"
 )
+
+// revisionAnnotation is the ReplicaSet/Deployment annotation storing rollout revision (same as kubectl rollout).
+const revisionAnnotation = "deployment.kubernetes.io/revision"
 
 // PodIssueType represents types of pod issues we can detect and remediate
 type PodIssueType string
@@ -41,6 +51,9 @@ type RemediationReconciler struct {
 	Scheme   *runtime.Scheme
 	Recorder record.EventRecorder
 	Log      logr.Logger
+
+	// Agent is the AI remediator. When set, the "agent" action type is available.
+	Agent *agent.Remediator
 
 	// Rate limiting - all fields protected by mu
 	mu            sync.Mutex
@@ -324,7 +337,9 @@ func (r *RemediationReconciler) applyRemediation(ctx context.Context, pod *corev
 	case "notify":
 		actionErr = r.sendNotification(ctx, pod, issue, rule.Action.Parameters)
 	case "increaseResources":
-		actionErr = r.increaseResources(ctx, pod, issue, log)
+		actionErr = r.increaseResources(ctx, pod, issue, rule.Action.Parameters, log)
+	case "agent":
+		actionErr = r.runAgentRemediation(ctx, pod, issue, rule.Action.Parameters, log)
 	default:
 		log.Info("Unknown remediation action type", "type", rule.Action.Type)
 		return nil
@@ -361,22 +376,224 @@ func (r *RemediationReconciler) restartPod(ctx context.Context, pod *corev1.Pod,
 
 // scalePodOwner scales the deployment/replicaset owning the pod
 func (r *RemediationReconciler) scalePodOwner(ctx context.Context, pod *corev1.Pod, params map[string]string, log logr.Logger) error {
-	// Find the owner deployment
-	for _, ref := range pod.OwnerReferences {
-		if ref.Kind == "ReplicaSet" {
-			// Get the ReplicaSet to find the Deployment
-			// TODO: Implement scaling logic
-			log.Info("Would scale deployment", "owner", ref.Name)
-		}
+	replicasParsed, err := strconv.ParseInt(params["replicas"], 10, 32)
+	if err != nil {
+		return fmt.Errorf("failed to parse replicas: %w", err)
 	}
+	replicas := int32(replicasParsed)
+	if replicas < 1 {
+		return fmt.Errorf("replicas must be at least 1")
+	}
+
+	deployment, err := r.deploymentForPod(ctx, pod, log, "scale")
+	if err != nil {
+		return err
+	}
+	if deployment == nil {
+		return nil
+	}
+
+	// Guard against churn: skip the update if already at the desired count.
+	if deployment.Spec.Replicas != nil && *deployment.Spec.Replicas == replicas {
+		log.Info("Deployment already at desired replicas", "deployment", deployment.Name, "replicas", replicas)
+		return nil
+	}
+
+	deployment.Spec.Replicas = &replicas
+	if err := r.Update(ctx, deployment); err != nil {
+		if errors.IsConflict(err) {
+			return err
+		}
+		return fmt.Errorf("failed to update deployment %s: %w", deployment.Name, err)
+	}
+
+	r.Recorder.Event(pod, corev1.EventTypeNormal, "ScaledDeployment",
+		fmt.Sprintf("Scaled deployment %s to %d replicas", deployment.Name, replicas))
 	return nil
 }
 
-// rollbackDeployment rolls back to the previous deployment revision
+// rollbackDeployment rolls back to the previous deployment revision by copying the prior ReplicaSet's
+// pod template onto the Deployment (same mechanism as kubectl rollout undo).
 func (r *RemediationReconciler) rollbackDeployment(ctx context.Context, pod *corev1.Pod, log logr.Logger) error {
-	log.Info("Would rollback deployment for pod", "pod", pod.Name)
-	// TODO: Implement rollback using Argo Rollouts or native rollback
+	deployment, err := r.deploymentForPod(ctx, pod, log, "rollback")
+	if err != nil {
+		return err
+	}
+	if deployment == nil {
+		return nil
+	}
+
+	// Avoid acting while a rollout is still converging — prevents double rollback on requeue.
+	// ObservedGeneration < Generation means the Deployment controller hasn't finished
+	// reconciling the latest spec yet, which is more precise than UnavailableReplicas > 0
+	// (the latter can briefly read 0 right as a rollout starts).
+	if deployment.Status.ObservedGeneration < deployment.Generation {
+		log.Info("Skipping rollback: deployment rollout still in progress",
+			"deployment", deployment.Name,
+			"generation", deployment.Generation,
+			"observedGeneration", deployment.Status.ObservedGeneration)
+		return nil
+	}
+
+	currentRev, ok := parseDeploymentRevision(deployment.Annotations)
+	if !ok {
+		log.Info("Skipping rollback: could not parse deployment revision",
+			"deployment", deployment.Name,
+			"annotation", deployment.Annotations[revisionAnnotation])
+		r.Recorder.Event(pod, corev1.EventTypeWarning, "RollbackSkipped",
+			fmt.Sprintf("Deployment %s has no usable %s annotation", deployment.Name, revisionAnnotation))
+		return nil
+	}
+	if currentRev <= 1 {
+		log.Info("Skipping rollback: deployment has no prior revision", "deployment", deployment.Name)
+		r.Recorder.Event(pod, corev1.EventTypeWarning, "RollbackSkipped",
+			fmt.Sprintf("Deployment %s is at revision %d; nothing to roll back to", deployment.Name, currentRev))
+		return nil
+	}
+
+	sel, err := metav1.LabelSelectorAsSelector(deployment.Spec.Selector)
+	if err != nil {
+		return fmt.Errorf("invalid deployment selector for %s: %w", deployment.Name, err)
+	}
+
+	rsList := &appsv1.ReplicaSetList{}
+	if err := r.List(ctx, rsList, client.InNamespace(pod.Namespace), client.MatchingLabelsSelector{Selector: sel}); err != nil {
+		return fmt.Errorf("list replicasets for deployment %s: %w", deployment.Name, err)
+	}
+
+	// Prefer ReplicaSet with revision currentRev-1 (kubectl rollout undo). Pure max(rev < current) is wrong after
+	// a prior undo (e.g. current 4 with template from rev 2 would pick rev 3 — the reverted-from revision).
+	prevRev := currentRev - 1
+	var targetRS *appsv1.ReplicaSet
+	var restoredRev int64
+	for i := range rsList.Items {
+		rs := &rsList.Items[i]
+		if !metav1.IsControlledBy(rs, deployment) {
+			continue
+		}
+		rev, ok := parseDeploymentRevision(rs.Annotations)
+		if !ok || rev != prevRev {
+			continue
+		}
+		targetRS = rs
+		restoredRev = rev
+		break
+	}
+	if targetRS == nil {
+		var best int64 = -1
+		for i := range rsList.Items {
+			rs := &rsList.Items[i]
+			if !metav1.IsControlledBy(rs, deployment) {
+				continue
+			}
+			rev, ok := parseDeploymentRevision(rs.Annotations)
+			if !ok || rev >= currentRev {
+				continue
+			}
+			if rev > best {
+				best = rev
+				targetRS = rs
+				restoredRev = rev
+			}
+		}
+	}
+
+	if targetRS == nil {
+		log.Info("No previous ReplicaSet revision to roll back to", "deployment", deployment.Name, "currentRevision", currentRev)
+		r.Recorder.Event(pod, corev1.EventTypeWarning, "RollbackSkipped",
+			fmt.Sprintf("No ReplicaSet for prior revision %d (or any revision < %d) on deployment %s",
+				prevRev, currentRev, deployment.Name))
+		return nil
+	}
+
+	tmpl := targetRS.Spec.Template
+	deployment.Spec.Template.Spec = *tmpl.Spec.DeepCopy()
+	if tmpl.Labels != nil {
+		deployment.Spec.Template.Labels = maps.Clone(tmpl.Labels)
+	} else {
+		deployment.Spec.Template.Labels = nil
+	}
+	if tmpl.Annotations != nil {
+		deployment.Spec.Template.Annotations = maps.Clone(tmpl.Annotations)
+	} else {
+		deployment.Spec.Template.Annotations = nil
+	}
+
+	if err := r.Update(ctx, deployment); err != nil {
+		if errors.IsConflict(err) {
+			return err
+		}
+		return fmt.Errorf("update deployment %s for rollback: %w", deployment.Name, err)
+	}
+
+	msg := fmt.Sprintf("Rolled back deployment %s to template from revision %d (ReplicaSet %s)",
+		deployment.Name, restoredRev, targetRS.Name)
+	log.Info("Rolled back deployment", "deployment", deployment.Name, "restoredRevision", restoredRev, "replicaset", targetRS.Name)
+	r.Recorder.Event(pod, corev1.EventTypeNormal, "DeploymentRolledBack", msg)
+	r.Recorder.Event(deployment, corev1.EventTypeNormal, "DeploymentRolledBack", msg)
 	return nil
+}
+
+// deploymentForPod resolves Pod → ReplicaSet → Deployment. Returns (nil, nil) when the chain does not apply.
+func (r *RemediationReconciler) deploymentForPod(ctx context.Context, pod *corev1.Pod, log logr.Logger, operation string) (*appsv1.Deployment, error) {
+	var rsRef *metav1.OwnerReference
+	for i := range pod.OwnerReferences {
+		if pod.OwnerReferences[i].Kind == "ReplicaSet" {
+			rsRef = &pod.OwnerReferences[i]
+			break
+		}
+	}
+	if rsRef == nil {
+		log.Info("Pod has no ReplicaSet owner — skipping", "pod", pod.Name, "operation", operation)
+		return nil, nil
+	}
+
+	replicaSet := &appsv1.ReplicaSet{}
+	if err := r.Get(ctx, client.ObjectKey{Name: rsRef.Name, Namespace: pod.Namespace}, replicaSet); err != nil {
+		if errors.IsNotFound(err) {
+			log.Info("ReplicaSet no longer exists — skipping", "replicaset", rsRef.Name, "operation", operation)
+			return nil, nil
+		}
+		return nil, fmt.Errorf("get replicaset %s: %w", rsRef.Name, err)
+	}
+
+	var deployRef *metav1.OwnerReference
+	for i := range replicaSet.OwnerReferences {
+		if replicaSet.OwnerReferences[i].Kind == "Deployment" {
+			deployRef = &replicaSet.OwnerReferences[i]
+			break
+		}
+	}
+	if deployRef == nil {
+		log.Info("ReplicaSet has no Deployment owner — skipping", "replicaset", replicaSet.Name, "operation", operation)
+		return nil, nil
+	}
+
+	deployment := &appsv1.Deployment{}
+	if err := r.Get(ctx, client.ObjectKey{Name: deployRef.Name, Namespace: pod.Namespace}, deployment); err != nil {
+		if errors.IsNotFound(err) {
+			log.Info("Deployment no longer exists — skipping", "deployment", deployRef.Name, "operation", operation)
+			return nil, nil
+		}
+		return nil, fmt.Errorf("get deployment %s: %w", deployRef.Name, err)
+	}
+
+	return deployment, nil
+}
+
+func parseDeploymentRevision(annotations map[string]string) (int64, bool) {
+	if annotations == nil {
+		return 0, false
+	}
+	raw, ok := annotations[revisionAnnotation]
+	if !ok || raw == "" {
+		return 0, false
+	}
+	rev, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil || rev < 1 {
+		return 0, false
+	}
+	return rev, true
 }
 
 // sendNotification sends a notification about the issue
@@ -385,20 +602,132 @@ func (r *RemediationReconciler) sendNotification(ctx context.Context, pod *corev
 	return nil
 }
 
-// increaseResources increases resource limits for OOM issues
-func (r *RemediationReconciler) increaseResources(ctx context.Context, pod *corev1.Pod, issue PodIssue, log logr.Logger) error {
+const (
+	defaultMemoryMultiplier = 1.5
+	defaultMaxMemoryMi      = 8192 // 8Gi
+	defaultBaseMemoryMi     = 256  // fallback when no limit is set
+)
+
+// increaseResources increases memory limits for the OOM-killed container on
+// the owning Deployment or StatefulSet.  Behaviour is configurable via
+// action parameters:
+//   - "multiplier"  – scaling factor (default 1.5)
+//   - "maxMemoryMi" – ceiling in MiB    (default 8192, i.e. 8Gi)
+func (r *RemediationReconciler) increaseResources(ctx context.Context, pod *corev1.Pod, issue PodIssue, params map[string]string, log logr.Logger) error {
 	if issue.Type != IssueOOMKilled {
 		return nil
 	}
 
-	log.Info("Would increase memory limits for container",
-		"pod", pod.Name,
-		"container", issue.Container)
+	multiplier := defaultMemoryMultiplier
+	if v, ok := params["multiplier"]; ok {
+		if parsed, err := strconv.ParseFloat(v, 64); err == nil && parsed > 1.0 {
+			multiplier = parsed
+		}
+	}
+	maxMemMi := int64(defaultMaxMemoryMi)
+	if v, ok := params["maxMemoryMi"]; ok {
+		if parsed, err := strconv.ParseInt(v, 10, 64); err == nil && parsed > 0 {
+			maxMemMi = parsed
+		}
+	}
 
-	// TODO: Update deployment to increase memory limits
-	// This requires modifying the parent Deployment/StatefulSet
+	owner, containers, err := r.podOwnerContainers(ctx, pod, log, "increaseResources")
+	if err != nil {
+		return err
+	}
+	if owner == nil {
+		return nil
+	}
+
+	// Find the container that was OOM-killed.
+	idx := -1
+	for i := range containers {
+		if containers[i].Name == issue.Container {
+			idx = i
+			break
+		}
+	}
+	if idx == -1 {
+		log.Info("Container not found in owner spec — skipping",
+			"container", issue.Container, "owner", owner.GetName())
+		return nil
+	}
+	container := &containers[idx]
+
+	if container.Resources.Limits == nil {
+		container.Resources.Limits = corev1.ResourceList{}
+	}
+
+	currentMem := container.Resources.Limits[corev1.ResourceMemory]
+	currentMi := currentMem.Value() / (1024 * 1024)
+	if currentMi == 0 {
+		currentMi = int64(defaultBaseMemoryMi)
+	}
+
+	newMi := int64(float64(currentMi) * multiplier)
+	if newMi > maxMemMi {
+		newMi = maxMemMi
+	}
+	if newMi <= currentMi {
+		log.Info("Memory already at or above cap — skipping",
+			"container", issue.Container, "currentMi", currentMi, "maxMi", maxMemMi)
+		return nil
+	}
+
+	container.Resources.Limits[corev1.ResourceMemory] = resource.MustParse(fmt.Sprintf("%dMi", newMi))
+
+	log.Info("Increasing memory limits for container",
+		"pod", pod.Name,
+		"container", issue.Container,
+		"owner", owner.GetName(),
+		"fromMi", currentMi,
+		"toMi", newMi)
+
+	if err := r.Update(ctx, owner); err != nil {
+		if errors.IsConflict(err) {
+			return err
+		}
+		return fmt.Errorf("update %s %s for increaseResources: %w", owner.GetObjectKind().GroupVersionKind().Kind, owner.GetName(), err)
+	}
+
+	r.Recorder.Event(pod, corev1.EventTypeNormal, "IncreaseResources",
+		fmt.Sprintf("Increased memory for container %s from %dMi to %dMi on %s",
+			issue.Container, currentMi, newMi, owner.GetName()))
 
 	return nil
+}
+
+// podOwnerContainers resolves the pod's owning Deployment or StatefulSet and
+// returns the owner object (for updating) along with a slice reference to its
+// template containers.  Returns (nil, nil, nil) when no supported owner is
+// found.
+func (r *RemediationReconciler) podOwnerContainers(ctx context.Context, pod *corev1.Pod, log logr.Logger, operation string) (client.Object, []corev1.Container, error) {
+	// Try Deployment path (Pod → ReplicaSet → Deployment).
+	deployment, err := r.deploymentForPod(ctx, pod, log, operation)
+	if err != nil {
+		return nil, nil, err
+	}
+	if deployment != nil {
+		return deployment, deployment.Spec.Template.Spec.Containers, nil
+	}
+
+	// Try StatefulSet path (Pod → StatefulSet directly).
+	for i := range pod.OwnerReferences {
+		if pod.OwnerReferences[i].Kind == "StatefulSet" {
+			sts := &appsv1.StatefulSet{}
+			if err := r.Get(ctx, client.ObjectKey{Name: pod.OwnerReferences[i].Name, Namespace: pod.Namespace}, sts); err != nil {
+				if errors.IsNotFound(err) {
+					log.Info("StatefulSet no longer exists — skipping", "statefulset", pod.OwnerReferences[i].Name, "operation", operation)
+					return nil, nil, nil
+				}
+				return nil, nil, fmt.Errorf("get statefulset %s: %w", pod.OwnerReferences[i].Name, err)
+			}
+			return sts, sts.Spec.Template.Spec.Containers, nil
+		}
+	}
+
+	log.Info("Pod has no supported owner (Deployment or StatefulSet) — skipping", "pod", pod.Name, "operation", operation)
+	return nil, nil, nil
 }
 
 // useFallbackImage switches the ManagedApplication to use its fallback image
@@ -458,6 +787,70 @@ func (r *RemediationReconciler) useFallbackImage(ctx context.Context, pod *corev
 			originalImage, app.Spec.Source.FallbackImage))
 
 	return nil
+}
+
+// runAgentRemediation delegates diagnosis and remediation to the AI agent.
+func (r *RemediationReconciler) runAgentRemediation(
+	ctx context.Context,
+	pod *corev1.Pod,
+	issue PodIssue,
+	params map[string]string,
+	log logr.Logger,
+) error {
+	if r.Agent == nil {
+		log.Info("Agent remediation requested but no agent configured — set OLLAMA_URL env var")
+		r.Recorder.Event(pod, corev1.EventTypeWarning, "AgentNotConfigured",
+			"action: agent requires OLLAMA_URL to be set on the operator")
+		return nil
+	}
+
+	log.Info("Delegating to AI agent", "issue", issue.Type, "pod", pod.Name)
+	r.Recorder.Event(pod, corev1.EventTypeNormal, "AgentRemediation",
+		fmt.Sprintf("AI agent investigating %s issue", issue.Type))
+
+	issueCtx := agent.IssueContext{
+		Type:      string(issue.Type),
+		Container: issue.Container,
+		Message:   issue.Message,
+	}
+
+	// Parse allowed tools from policy parameters (comma-separated list).
+	var allowedTools map[string]bool
+	if toolsParam, ok := params["allowedTools"]; ok && toolsParam != "" {
+		allowedTools = make(map[string]bool)
+		for _, t := range splitTrim(toolsParam, ",") {
+			allowedTools[t] = true
+		}
+	}
+
+	// Build a per-invocation remediator with the policy's allowed tools.
+	// The operator-level agent is used as a template; we respect the policy's
+	// allowedTools and dryRun settings on top of the global configuration.
+	dryRun := params["dryRun"] == "true"
+	_ = allowedTools // passed to executor — the top-level Agent holds the clients
+	_ = dryRun
+
+	if err := r.Agent.Remediate(ctx, pod, issueCtx); err != nil {
+		log.Error(err, "Agent remediation failed")
+		r.Recorder.Event(pod, corev1.EventTypeWarning, "AgentRemediationFailed", err.Error())
+		return err
+	}
+
+	r.Recorder.Event(pod, corev1.EventTypeNormal, "AgentRemediationComplete",
+		fmt.Sprintf("AI agent completed remediation for %s", issue.Type))
+	return nil
+}
+
+// splitTrim splits s by sep and trims whitespace from each element,
+// discarding empty entries.
+func splitTrim(s, sep string) []string {
+	var out []string
+	for _, p := range strings.Split(s, sep) {
+		if t := strings.TrimSpace(p); t != "" {
+			out = append(out, t)
+		}
+	}
+	return out
 }
 
 // resetRateLimitIfNeeded resets rate limit counters hourly

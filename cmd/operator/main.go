@@ -15,6 +15,7 @@ import (
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 
 	agentv1alpha1 "github.com/kube-agent/kube-agent/pkg/apis/v1alpha1"
+	"github.com/kube-agent/kube-agent/pkg/agent"
 	"github.com/kube-agent/kube-agent/pkg/controllers/deployment"
 	"github.com/kube-agent/kube-agent/pkg/controllers/diagnostic"
 	"github.com/kube-agent/kube-agent/pkg/controllers/security"
@@ -37,9 +38,13 @@ func main() {
 	var probeAddr string
 	var enableSelfHealing bool
 	var enableSecurityScanning bool
+	var ollamaURL string
+	var ollamaModel string
 
 	flag.StringVar(&metricsAddr, "metrics-bind-address", ":8080", "The address the metric endpoint binds to.")
 	flag.StringVar(&probeAddr, "health-probe-bind-address", ":8081", "The address the probe endpoint binds to.")
+	flag.StringVar(&ollamaURL, "ollama-url", os.Getenv("OLLAMA_URL"), "Ollama base URL for AI-powered remediation (e.g. https://host/)")
+	flag.StringVar(&ollamaModel, "ollama-model", os.Getenv("OLLAMA_MODEL"), "Ollama model to use (default: "+agent.DefaultModel+")")
 	// Default to true: running without leader election in multi-replica deployments
 	// risks two controllers acting on the same resources simultaneously.
 	flag.BoolVar(&enableLeaderElection, "leader-elect", true,
@@ -103,10 +108,29 @@ func main() {
 
 	// Setup Self-Healing Controller
 	if enableSelfHealing {
+		// Build an AI remediator if an Ollama URL is configured.
+		var agentRemediator *agent.Remediator
+		if ollamaURL != "" {
+			clientset, err := kubernetes.NewForConfig(mgr.GetConfig())
+			if err != nil {
+				setupLog.Error(err, "unable to create clientset for agent remediator")
+				os.Exit(1)
+			}
+			agentRemediator = agent.NewRemediator(ollamaURL, ollamaModel,
+				mgr.GetClient(), clientset, nil, false)
+			setupLog.Info("AI agent remediator enabled", "url", ollamaURL, "model", func() string {
+				if ollamaModel != "" {
+					return ollamaModel
+				}
+				return agent.DefaultModel
+			}())
+		}
+
 		if err = (&selfheal.RemediationReconciler{
 			Client:   mgr.GetClient(),
 			Scheme:   mgr.GetScheme(),
 			Recorder: mgr.GetEventRecorderFor("remediation-controller"),
+			Agent:    agentRemediator,
 		}).SetupWithManager(mgr); err != nil {
 			setupLog.Error(err, "unable to create controller", "controller", "Remediation")
 			os.Exit(1)
